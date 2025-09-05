@@ -70,7 +70,7 @@ vultr实际上是折算成小时来计费的，比如服务器是5美元1个月�
 
 ![](https://cdn.jsdelivr.net/gh/Alvin9999/pac2/softimag/2025vultr-6.png)
 
-点击图中的系统名字，会弹出具体系统版本，推荐Debian 11
+点击图中的系统名字，会弹出具体系统版本，推荐Debian
 
 ![](https://cdn.jsdelivr.net/gh/Alvin9999/pac2/softimag/2025vultr-7.png)
 
@@ -150,13 +150,15 @@ xshell5:
 
 连接成功后，会出现如上图所示，之后就可以复制粘贴代码部署了。
 
-**一键部署sing-box管理脚本**
+**一键部署sing-box管理脚本（推荐Debian系统）**
 
 安装依赖:
 
 ```bash
-apt update && apt -y install curl wget tar socat jq git openssl uuid-runtime build-essential zlib1g-dev libssl-dev libevent-dev dnsutils cron
+apt update && apt -y install curl wget nginx  tar socat jq git openssl uuid-runtime build-essential zlib1g-dev libssl-dev libevent-dev dnsutils cron
 ```
+
+**Debian系统安装依赖很快，Ubuntu系统安装要慢一点，耐心等待依赖自动安装完成。**
 
 安装脚本:
 
