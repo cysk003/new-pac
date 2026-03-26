@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（18 节点：直连 9 + WARP 9）
-#  Version: v2.4.7
+#  Version: v4.4.0
 #  author：Alvin9999
-#  Repo: https://github.com/Alvin9999/Sing-Box-Plus
+#  Repo: https://github.com/Alvin9999-newpac/Sing-Box-Plus
 # ============================================================
 
 set -Eeuo pipefail
@@ -87,9 +87,9 @@ sbp_pm_refresh() {
   case "$PM" in
     apt)
       apt_allow_release_change
-      sed -i 's#^deb http://#deb https://#' /etc/apt/sources.list 2>/dev/null || true
+      [[ -f /etc/apt/sources.list ]] && sed -i 's#^deb http://#deb https://#' /etc/apt/sources.list 2>/dev/null || true
       # 修正 bullseye 的 security 行：bullseye/updates → debian-security bullseye-security
-      sed -i -E 's#^(deb\s+https?://security\.debian\.org)(/debian-security)?\s+bullseye/updates(.*)$#\1/debian-security bullseye-security\3#' /etc/apt/sources.list
+      [[ -f /etc/apt/sources.list ]] && sed -i -E 's#^(deb\s+https?://security\.debian\.org)(/debian-security)?\s+bullseye/updates(.*)$#\1/debian-security bullseye-security\3#' /etc/apt/sources.list || true
 
       local AOPT=""
       curl -6 -fsS --connect-timeout 2 https://deb.debian.org >/dev/null 2>&1 || AOPT='-o Acquire::ForceIPv4=true'
@@ -182,7 +182,7 @@ install_singbox_binary() {
 
   ensure_jq_static || { echo "[ERROR] 无法获取 jq，二进制模式失败"; rm -rf "$tmp"; return 1; }
 
-  json="$(with_retry 3 curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest)" || { rm -rf "$tmp"; return 1; }
+json="$(with_retry 3 curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest)" || { rm -rf "$tmp"; return 1; }
   url="$(printf '%s' "$json" | jq -r --arg a "$goarch" '
     .assets[] | select(.name|test("linux-" + $a + "\\.(tar\\.(xz|gz)|zip)$")) | .browser_download_url
   ' | head -n1)"
@@ -286,7 +286,7 @@ ENABLE_TUIC=${ENABLE_TUIC:-true}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v2.4.7"
+SCRIPT_VERSION="v4.4.0"
 REALITY_SERVER=${REALITY_SERVER:-www.microsoft.com}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -303,7 +303,9 @@ hr(){ printf "${C_DIM}==========================================================
 
 # ===== 基础工具 =====
 info(){ echo -e "[${C_CYAN}信息${C_RESET}] $*"; }
+ok(){   echo -e "[${C_GREEN}成功${C_RESET}] $*"; }
 warn(){ echo -e "[${C_YELLOW}警告${C_RESET}] $*"; }
+err(){  echo -e "[${C_RED}错误${C_RESET}] $*" >&2; }
 die(){  echo -e "[${C_RED}错误${C_RESET}] $*" >&2; exit 1; }
 
 # --- 架构映射：uname -m -> 发行资产名 ---
@@ -538,6 +540,8 @@ mk_cert(){
       -keyout "$key" -out "$crt" -subj "/CN=$REALITY_SERVER" \
       -addext "subjectAltName=DNS:$REALITY_SERVER" >/dev/null 2>&1
   fi
+    CRT_SHA256=$(openssl x509 -in "$crt" -fingerprint -sha256 -noout \
+    | sed 's/SHA256 Fingerprint=//;s/://g' | tr 'A-F' 'a-f')
 }
 
 ensure_creds(){
@@ -560,7 +564,7 @@ ensure_creds(){
 
 # ===== WARP（wgcf） =====
 WGCF_BIN=/usr/local/bin/wgcf
-install_wgcf(){
+install_wgcf_disabled(){
   [[ -x "$WGCF_BIN" ]] && return 0
   local GOA url tmp
   case "$(arch_map)" in
@@ -590,8 +594,200 @@ pad_b64(){
 }
 
 
-# ===== WARP（wgcf）配置生成/修复 =====
-ensure_warp_profile(){
+# ===== WARP（官方 warp-cli，proxy 模式）一键安装/修复 =====
+# 说明：
+# - 本脚本强制使用官方 cloudflare-warp (warp-cli) 提供本地 SOCKS5 (默认 127.0.0.1:40000)
+# - sing-box 的 tag=warp 出站固定走该 SOCKS5
+WARP_SOCKS_HOST="${WARP_SOCKS_HOST:-127.0.0.1}"
+WARP_SOCKS_PORT="${WARP_SOCKS_PORT:-40000}"
+
+install_warpcli(){
+  command -v warp-cli >/dev/null 2>&1 && return 0
+
+  if command -v apt-get >/dev/null 2>&1; then
+    info "安装 cloudflare-warp (Debian/Ubuntu)..."
+    apt-get update -y
+    apt-get install -y curl gpg lsb-release ca-certificates >/dev/null 2>&1 || true
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main"       > /etc/apt/sources.list.d/cloudflare-client.list
+    apt-get update -y
+    apt-get install -y cloudflare-warp
+  elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
+    info "安装 cloudflare-warp (CentOS/RHEL)..."
+    curl -fsSl https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo >/dev/null
+    if command -v dnf >/dev/null 2>&1; then
+      dnf install -y cloudflare-warp
+    else
+      yum install -y cloudflare-warp
+    fi
+  else
+    err "未识别的包管理器，无法自动安装 cloudflare-warp"
+    return 1
+  fi
+
+  command -v warp-cli >/dev/null 2>&1
+}
+
+ensure_warpcli_proxy(){
+  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
+
+  install_warpcli || return 1
+
+  systemctl enable --now warp-svc >/dev/null 2>&1 || true
+
+  # 已注册则跳过；未注册则自动同意条款
+  if ! warp-cli registration show >/dev/null 2>&1; then
+    info "正在初始化 Cloudflare WARP"
+
+    # warp-cli 强制检测 TTY，非 TTY 拒绝输入，需模拟真实终端注入 y
+    # 优先级：python3 pty（最可靠）→ expect → 安装 python3 兜底
+    _warp_reg_ok=0
+
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - <<'PYEOF' 2>/dev/null && _warp_reg_ok=1 || true
+import pty, os, time, select, sys
+
+def run():
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp("warp-cli", ["warp-cli", "registration", "new"])
+    else:
+        answered = False
+        for _ in range(30):
+            r, _, _ = select.select([fd], [], [], 1)
+            if r:
+                try:
+                    data = os.read(fd, 4096).decode(errors="ignore")
+                except OSError:
+                    break
+                if not answered and ("y/N" in data or "y/n" in data):
+                    time.sleep(0.2)
+                    os.write(fd, b"y\n")
+                    answered = True
+                if "Success" in data:
+                    sys.exit(0)
+            try:
+                ret = os.waitpid(pid, os.WNOHANG)
+                if ret[0] != 0:
+                    break
+            except ChildProcessError:
+                break
+        try:
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+        sys.exit(1)
+
+run()
+PYEOF
+
+    elif command -v expect >/dev/null 2>&1; then
+      expect -c '
+        spawn warp-cli registration new
+        expect -re {[yY]/[nN]}
+        send "y\r"
+        expect eof
+      ' >/dev/null 2>&1 && _warp_reg_ok=1 || true
+
+    else
+      # 尝试安装 python3（兜底）
+      warn "未找到 python3/expect，尝试安装 python3..."
+      if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y python3 >/dev/null 2>&1 || true
+      elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y python3 >/dev/null 2>&1 || true
+      elif command -v yum >/dev/null 2>&1; then
+        yum install -y python3 >/dev/null 2>&1 || true
+      elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm python >/dev/null 2>&1 || true
+      elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install python3 >/dev/null 2>&1 || true
+      fi
+
+      if command -v python3 >/dev/null 2>&1; then
+        python3 - <<'PYEOF' 2>/dev/null && _warp_reg_ok=1 || true
+import pty, os, time, select, sys
+
+def run():
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvp("warp-cli", ["warp-cli", "registration", "new"])
+    else:
+        answered = False
+        for _ in range(30):
+            r, _, _ = select.select([fd], [], [], 1)
+            if r:
+                try:
+                    data = os.read(fd, 4096).decode(errors="ignore")
+                except OSError:
+                    break
+                if not answered and ("y/N" in data or "y/n" in data):
+                    time.sleep(0.2)
+                    os.write(fd, b"y\n")
+                    answered = True
+                if "Success" in data:
+                    sys.exit(0)
+            try:
+                ret = os.waitpid(pid, os.WNOHANG)
+                if ret[0] != 0:
+                    break
+            except ChildProcessError:
+                break
+        try:
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+        sys.exit(1)
+
+run()
+PYEOF
+      else
+        err "无法自动完成 WARP 注册（缺少 python3/expect），请手动运行：warp-cli registration new"
+        return 1
+      fi
+    fi
+
+    sleep 2
+    if ! warp-cli registration show >/dev/null 2>&1; then
+      err "WARP 注册失败，请手动运行：warp-cli registration new"; return 1
+    fi
+  fi
+
+  # proxy 模式：不改系统默认路由
+  warp-cli mode proxy >/dev/null 2>&1 || true
+
+  # 连接
+  warp-cli connect >/dev/null 2>&1 || return 1
+
+  # 等待 socks 端口监听
+  for i in {1..12}; do
+    if ss -lntp 2>/dev/null | grep -q ":${WARP_SOCKS_PORT}\b" || netstat -lntp 2>/dev/null | grep -q ":${WARP_SOCKS_PORT}\b"; then
+      break
+    fi
+    sleep 1
+  done
+
+  if !( ss -lntp 2>/dev/null | grep -q ":${WARP_SOCKS_PORT}\b" || netstat -lntp 2>/dev/null | grep -q ":${WARP_SOCKS_PORT}\b" ); then
+    err "WARP SOCKS5 端口 ${WARP_SOCKS_PORT} 未监听（warp-svc/warp-cli 可能未正常工作）"
+    systemctl status warp-svc --no-pager | head -80 || true
+    journalctl -u warp-svc -n 120 --no-pager || true
+    return 1
+  fi
+
+  # 真正测试 warp=on
+  if ! curl -fsSL --proxy "socks5://${WARP_SOCKS_HOST}:${WARP_SOCKS_PORT}" https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+    err "WARP 代理测试失败：未检测到 warp=on"
+    warp-cli status || true
+    return 1
+  fi
+
+  ok "WARP proxy 已就绪：socks5://${WARP_SOCKS_HOST}:${WARP_SOCKS_PORT}"
+  return 0
+}
+
+# ===== WARP（wgcf）配置生成/修复（已废弃/不再默认使用，保留旧代码以兼容历史） =====
+
+ensure_wgcf_profile(){
   [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
 
   # 先尝试读取旧 env，并做一次规范化补齐
@@ -608,7 +804,7 @@ ensure_warp_profile(){
   fi
 
   # 走到这里说明旧 env 不完整；开始用 wgcf 重建
-  install_wgcf || { warn "wgcf 安装失败，禁用 WARP 节点"; ENABLE_WARP=false; save_env; return 0; }
+  install_wgcf_disabled || { warn "wgcf 安装失败，禁用 WARP 节点"; ENABLE_WARP=false; save_env; return 0; }
 
   local wd="$SB_DIR/wgcf"; mkdir -p "$wd"
   if [[ ! -f "$wd/wgcf-account.toml" ]]; then
@@ -718,12 +914,13 @@ install_singbox() {
 write_systemd(){ cat > "/etc/systemd/system/${SYSTEMD_SERVICE}" <<EOF
 [Unit]
 Description=Sing-Box (Native 18 nodes)
-After=network-online.target
+After=network-online.target warp-svc.service
+Wants=network-online.target warp-svc.service
 Requires=network-online.target
 
 [Service]
 Type=simple
-Environment=ENABLE_DEPRECATED_WIREGUARD_OUTBOUND=true
+Environment=ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true
 ExecStart=${BIN_PATH} run -c ${CONF_JSON} -D ${DATA_DIR}
 Restart=on-failure
 RestartSec=3
@@ -742,11 +939,12 @@ systemctl enable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
 write_config(){
   ensure_dirs; load_env || true; load_creds || true; load_ports || true
   ensure_creds; save_all_ports; mk_cert
-  [[ "$ENABLE_WARP" == "true" ]] && ensure_warp_profile || true
+  [[ "$ENABLE_WARP" == "true" ]] && ensure_warpcli_proxy
 
   local CRT="$CERT_DIR/fullchain.pem" KEY="$CERT_DIR/key.pem"
   jq -n \
   --arg RS "$REALITY_SERVER" --argjson RSP "${REALITY_SERVER_PORT:-443}" --arg UID "$UUID" \
+  --arg WSHOST "$WARP_SOCKS_HOST" --argjson WSPORT "$WARP_SOCKS_PORT" \
   --arg RPR "$REALITY_PRIV" --arg RPB "$REALITY_PUB" --arg SID "$REALITY_SID" \
   --arg HY2 "$HY2_PWD" --arg HY22 "$HY2_PWD2" --arg HY2O "$HY2_OBFS_PWD" \
   --arg GRPC "$GRPC_SERVICE" --arg VMWS "$VMESS_WS_PATH" --arg CRT "$CRT" --arg KEY "$KEY" \
@@ -774,22 +972,13 @@ write_config(){
   def inbound_tuic($port): {type:"tuic", listen:"::", listen_port:$port, users:[{uuid:$TUICUUID, password:$TUICPWD}], congestion_control:"bbr", tls:{enabled:true, certificate_path:$CRT, key_path:$KEY, alpn:["h3"]}};
 
   def warp_outbound:
-    {type:"wireguard", tag:"warp",
-      local_address: ( [ $W4, $W6 ] | map(select(. != "")) ),
-      system_interface: false,
-      private_key:$WPRIV,
-      peers: [ {
-        server:$WHOST, server_port:$WPORT, public_key:$WPPUB,
-        reserved: [ $WR1, $WR2, $WR3 ],
-        allowed_ips: ["0.0.0.0/0","::/0"]
-      } ],
-      mtu:1280
-    };
+    {type:"socks", tag:"warp", server:$WSHOST, server_port:$WSPORT};
+
 
   {
     log:{level:"info", timestamp:true},
-    dns:{ servers:[ {tag:"dns-remote", address:"https://1.1.1.1/dns-query", detour:"direct"}, {address:"tls://dns.google", detour:"direct"} ], strategy:"prefer_ipv4" },
-    inbounds:[
+  dns:{ servers:[ {type:"https", tag:"dns-remote", server:"1.1.1.1", server_port:443, path:"/dns-query"}, {type:"udp", tag:"dns-local", server:"8.8.8.8"} ], strategy:"prefer_ipv4" },
+  inbounds:[
       (inbound_vless_flow($P1) + {tag:"vless-reality"}),
       (inbound_vless($P2) + {tag:"vless-grpcr", transport:{type:"grpc", service_name:$GRPC}}),
       (inbound_trojan($P3) + {tag:"trojan-reality"}),
@@ -811,14 +1000,14 @@ write_config(){
       (inbound_tuic($PW9) + {tag:"tuic-v5-warp"})
     ],
     outbounds: (
-      if $ENABLE_WARP=="true" and ($WPRIV|length)>0 and ($WHOST|length)>0 then
+      if $ENABLE_WARP=="true" then
         [{type:"direct", tag:"direct"}, {type:"block", tag:"block"}, warp_outbound]
       else
         [{type:"direct", tag:"direct"}, {type:"block", tag:"block"}]
       end
     ),
     route: (
-      if $ENABLE_WARP=="true" and ($WPRIV|length)>0 and ($WHOST|length)>0 then
+      if $ENABLE_WARP=="true" then
         { default_domain_resolver:"dns-remote", rules:[
             { inbound: ["vless-reality-warp","vless-grpcr-warp","trojan-reality-warp","hy2-warp","vmess-ws-warp","hy2-obfs-warp","ss2022-warp","ss-warp","tuic-v5-warp"], outbound:"warp" }
           ],
@@ -841,17 +1030,41 @@ open_firewall(){
   rules+=("${PORT_VLESSR_W}/tcp" "${PORT_VLESS_GRPCR_W}/tcp" "${PORT_TROJANR_W}/tcp" "${PORT_VMESS_WS_W}/tcp")
   rules+=("${PORT_HY2_W}/udp" "${PORT_HY2_OBFS_W}/udp" "${PORT_TUIC_W}/udp")
   rules+=("${PORT_SS2022_W}/tcp" "${PORT_SS2022_W}/udp" "${PORT_SS_W}/tcp" "${PORT_SS_W}/udp")
+
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q -E "active|活跃"; then
-    for r in "${rules[@]}"; do ufw allow "$r" >/dev/null 2>&1 || true; done; ufw reload >/dev/null 2>&1 || true
+    for r in "${rules[@]}"; do ufw allow "$r" >/dev/null 2>&1 || true; done
+    ufw reload >/dev/null 2>&1 || true
+
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     systemctl enable --now firewalld >/dev/null 2>&1 || true
-    for r in "${rules[@]}"; do firewall-cmd --permanent --add-port="$r" >/dev/null 2>&1 || true; done; firewall-cmd --reload >/dev/null 2>&1 || true
+    for r in "${rules[@]}"; do firewall-cmd --permanent --add-port="$r" >/dev/null 2>&1 || true; done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+
   else
     local p proto
-    for r in "${rules[@]}"; do p="${r%/*}"; proto="${r#*/}";
-      if [[ "$proto" == tcp ]]; then iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT; fi
-      if [[ "$proto" == udp ]]; then iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$p" -j ACCEPT; fi
+    for r in "${rules[@]}"; do
+      p="${r%/*}"; proto="${r#*/}"
+
+      # IPv4
+      if [[ "$proto" == tcp ]]; then
+        iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
+      fi
+      if [[ "$proto" == udp ]]; then
+        iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$p" -j ACCEPT
+      fi
+
+      # IPv6（关键补全）
+      if command -v ip6tables >/dev/null 2>&1; then
+        if [[ "$proto" == tcp ]]; then
+          ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$p" -j ACCEPT
+        fi
+        if [[ "$proto" == udp ]]; then
+          ip6tables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport "$p" -j ACCEPT
+        fi
+      fi
     done
+
+    # 保存（netfilter-persistent 通常会把 v4/v6 一起保存）
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
   fi
 }
@@ -902,15 +1115,19 @@ JSON
   links_warp+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${host}:${PORT_SS_W}#ss-warp")
   links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${host}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#tuic-v5-warp")
 
-  echo -e "${C_BLUE}${C_BOLD}分享链接（18 个）${C_RESET}"
+echo -e "${C_BLUE}${C_BOLD}分享链接（18 个）${C_RESET}"
   hr
   echo -e "${C_CYAN}${C_BOLD}【直连节点（9）】${C_RESET}（vless-reality / vless-grpc-reality / trojan-reality / vmess-ws / hy2 / hy2-obfs / ss2022 / ss / tuic）"
   for l in "${links_direct[@]}"; do echo "  $l"; done
   hr
   echo -e "${C_CYAN}${C_BOLD}【WARP 节点（9）】${C_RESET}（同上 9 种，带 -warp）"
   echo -e "${C_DIM}说明：带 -warp 的 9 个节点走 Cloudflare WARP 出口，流媒体解锁更友好${C_RESET}"
-  echo -e "${C_DIM}提示：TUIC 默认 allowInsecure=1，v2rayN 导入即用${C_RESET}"
   for l in "${links_warp[@]}"; do echo "  $l"; done
+  hr
+  echo -e "${C_YELLOW}📌 如果你使用 Xray-core v26.2.6+，hysteria2 节点的 allowInsecure 已被移除，${C_RESET}"
+  echo -e "${C_YELLOW}   请改用以下 pinnedPeerCertSha256 节点：${C_RESET}"
+  echo "  hy2://$(urlenc "${HY2_PWD}")@${host}:${PORT_HY2}?sni=${REALITY_SERVER}&pcs=${CRT_SHA256}#hysteria2-pinnedPeerCertSha256"
+  echo "  hy2://$(urlenc "${HY2_PWD}")@${host}:${PORT_HY2_W}?sni=${REALITY_SERVER}&pcs=${CRT_SHA256}#hysteria2-warp-pinnedPeerCertSha256"
   hr
 }
 
@@ -938,7 +1155,7 @@ banner(){
   clear >/dev/null 2>&1 || true
   hr
   echo -e " ${C_CYAN}🚀 ${SCRIPT_NAME} ${SCRIPT_VERSION} 🚀${C_RESET}"
-  echo -e "${C_CYAN} 脚本更新地址: https://github.com/Alvin9999/Sing-Box-Plus${C_RESET}"
+  echo -e "${C_CYAN} 脚本更新地址: https://github.com/Alvin9999-newpac/Sing-Box-Plus${C_RESET}"
 
   hr
   echo -e "系统加速状态：$(bbr_state)"
@@ -997,7 +1214,7 @@ deploy_native(){
   install_singbox
   write_config
   info "检查配置 ..."
-  ENABLE_DEPRECATED_WIREGUARD_OUTBOUND=true "$BIN_PATH" check -c "$CONF_JSON"
+  "$BIN_PATH" check -c "$CONF_JSON"
   info "写入并启用 systemd 服务 ..."
   write_systemd
   systemctl restart "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
@@ -1026,7 +1243,7 @@ menu(){
   set +e                                            # ← 关闭严格退出，避免中途被杀掉
   echo -e "${C_BLUE}[信息] 正在检查 sing-box 安装状态...${C_RESET}"
   install_singbox            || true
-  ensure_warp_profile        || true
+  ensure_warpcli_proxy        || true
   write_config               || { echo "[ERR] 生成配置失败"; }
   write_systemd              || true
   open_firewall              || true
